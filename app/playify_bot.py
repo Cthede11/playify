@@ -1757,8 +1757,17 @@ class LazySearchItem:
                 search_prefix = "ytsearch5:"
                 platform_name = "YouTube"
 
-            search_term = f"{self.title} {self.artist}"
-            logger.info(f"[LazyResolve] Resolving on {platform_name}: '{search_term}'")
+            # Validate title and artist before creating search term
+            title = self.title if self.title and self.title.strip() else "Unknown Title"
+            artist = self.artist if self.artist and self.artist.strip() else "Unknown Artist"
+            
+            if title == "Unknown Title" and artist == "Unknown Artist":
+                logger.error(f"[LazyResolve] Cannot resolve track: both title and artist are missing or empty.")
+                self.resolved_info = {'error': True, 'title': 'Unknown Track', 'message': 'Missing track information'}
+                return self.resolved_info
+
+            search_term = f"{title} {artist}"
+            logger.info(f"[LazyResolve] Resolving on {platform_name}: '{search_term}' (original platform: {self.original_platform})")
             try:
                 search_query = f"{search_prefix}{sanitize_query(search_term)}"
                 
@@ -1788,8 +1797,9 @@ class LazySearchItem:
                 return self.resolved_info
 
             except Exception as e:
-                logger.error(f"[LazyResolve] Failed to resolve '{search_term}' on {platform_name}: {e}")
-                self.resolved_info = {'error': True, 'title': search_term}
+                logger.error(f"[LazyResolve] Failed to resolve '{search_term}' on {platform_name}: {e}", exc_info=True)
+                logger.error(f"[LazyResolve] Track details - Title: '{title}', Artist: '{artist}', Original Platform: '{self.original_platform}'")
+                self.resolved_info = {'error': True, 'title': search_term, 'original_title': title, 'original_artist': artist, 'error_message': str(e)}
                 return self.resolved_info
 
 def _async_worker(func, *args):
@@ -4639,8 +4649,11 @@ def run_bot(status_queue, log_queue, command_queue):
                     resolved_info = await next_item.resolve()
 
                     if not resolved_info or resolved_info.get('error'):
-                        failed_title = resolved_info.get('title', 'unknown')
-                        logger.warning(f"[{guild_id}] Failed to resolve track '{failed_title}', skipping to the next one.")
+                        failed_title = resolved_info.get('title', 'unknown') if resolved_info else (next_item.title if hasattr(next_item, 'title') else 'unknown')
+                        original_title = resolved_info.get('original_title', '') if resolved_info else (next_item.title if hasattr(next_item, 'title') else '')
+                        original_artist = resolved_info.get('original_artist', '') if resolved_info else (next_item.artist if hasattr(next_item, 'artist') else '')
+                        error_message = resolved_info.get('error_message', '') if resolved_info else ''
+                        logger.warning(f"[{guild_id}] Failed to resolve track '{failed_title}' (Original: '{original_title}' by '{original_artist}'). Error: {error_message}. Skipping to the next one.")
                         if music_player.text_channel:
                             try:
                                 error_embed = Embed(
