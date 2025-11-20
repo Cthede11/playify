@@ -39,8 +39,8 @@ No worries — I made a Windows app that sets up everything for you in one go!
 You’ll just need to enter your **Discord token** + **Spotify / Genius API keys** once, and you’re done forever!
 
 **Get it here:**  
-📄 [Instructions & info](https://alan7383.github.io/playify/self-host.html)  
-⬇ [Direct download](https://github.com/alan7383/playify/releases/download/1.5.1/Playify_Setup_v1.5.1.exe)
+📄 [Instructions & info](https://cthede11.github.io/playify/self-host.html)  
+⬇ [Direct download](https://github.com/Cthede11/playify/releases/latest)
 
 ---
 
@@ -89,7 +89,7 @@ This is the easiest way to get the bot running.
 
 1.  **Clone the repository and enter it:**
     ```bash
-    git clone https://github.com/alan7383/playify.git
+    git clone https://github.com/Cthede11/playify.git
     cd playify
     ```
 2.  **Create your secret file:**
@@ -121,7 +121,7 @@ This is the easiest way to get the bot running.
 **Steps:**
 1.  Clone the repo:
     ```bash
-    git clone https://github.com/alan7383/playify.git
+    git clone https://github.com/Cthede11/playify.git
     cd playify
     ```
 2.  Install dependencies:
@@ -152,7 +152,7 @@ This is the easiest way to get the bot running.
 ## (＾▽＾) Use the Public Bot (No setup needed!)
 
 If you don’t want to self-host Playify, you can invite the **public Playify bot** hosted by me directly to your server!  
-Check it out and add it easily here: [https://alan7383.github.io/playify/](https://alan7383.github.io/playify/)
+Check it out and add it easily here: [https://cthede11.github.io/playify/](https://cthede11.github.io/playify/)
 
 This way, you get all the great Playify features without any installation or configuration hassle!
 

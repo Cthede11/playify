@@ -29,7 +29,7 @@ APP_NAME = "Playify"
 # The GitHub release tag MUST match this number, prefixed with 'v' (e.g., v1.2.1).
 # ==============================================================================
 CURRENT_VERSION = "1.3.0"
-UPDATE_REPO_URL = "https://api.github.com/repos/alan7383/playify/releases/latest"
+UPDATE_REPO_URL = "https://api.github.com/repos/Cthede11/playify/releases/latest"
 
 # Centralized path for all application data (config, browsers, etc.)
 APP_DATA_DIR = os.path.join(os.getenv('LOCALAPPDATA'), APP_NAME)
