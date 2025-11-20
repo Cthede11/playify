@@ -5807,6 +5807,236 @@ async def jumpto(interaction: discord.Interaction):
     )
     
     await interaction.followup.send(embed=embed, view=view, silent=SILENT_MESSAGES)
+
+# ==============================================================================
+# 5.5. USER CONTEXT MENU COMMANDS (Right-click on bot in voice channel)
+# ==============================================================================
+
+@bot.tree.context_menu(name="Pause/Resume")
+async def pause_resume_context(interaction: discord.Interaction, member: discord.Member):
+    """Pause or resume playback when right-clicking the bot in voice channel."""
+    if not interaction.guild:
+        await interaction.response.send_message(get_messages("command.error.guild_only", interaction.guild_id), ephemeral=True, silent=SILENT_MESSAGES)
+        return
+    
+    if member.id != bot.user.id or not member.bot:
+        embed = Embed(
+            description="These commands can only be used on Playify bot. Right-click on the bot in the voice channel to use these controls.",
+            color=0xFF9AA2 if get_mode(interaction.guild_id) else discord.Color.red()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = interaction.guild_id
+    state = get_guild_state(guild_id)
+    is_kawaii = (state.locale == Locale.EN_X_KAWAII)
+    music_player = state.music_player
+    voice_client = interaction.guild.voice_client
+
+    if not voice_client:
+        embed = Embed(
+            description=get_messages("no_playback", guild_id),
+            color=0xFF9AA2 if is_kawaii else discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+        return
+
+    if voice_client.is_paused():
+        if music_player.playback_started_at is None:
+            music_player.playback_started_at = time.time()
+        voice_client.resume()
+        embed = Embed(
+            description=get_messages("resume", guild_id),
+            color=0xB5EAD7 if is_kawaii else discord.Color.green()
+        )
+    elif voice_client.is_playing():
+        if music_player.playback_started_at:
+            elapsed_since_play = time.time() - music_player.playback_started_at
+            music_player.start_time += elapsed_since_play * music_player.playback_speed
+            music_player.playback_started_at = None
+        voice_client.pause()
+        embed = Embed(
+            description=get_messages("pause", guild_id),
+            color=0xFFB7B2 if is_kawaii else discord.Color.orange()
+        )
+    else:
+        embed = Embed(
+            description=get_messages("no_playback", guild_id),
+            color=0xFF9AA2 if is_kawaii else discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+        return
+
+    await interaction.followup.send(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+    bot.loop.create_task(update_controller(bot, interaction.guild.id))
+
+@bot.tree.context_menu(name="Skip Song")
+async def skip_context(interaction: discord.Interaction, member: discord.Member):
+    """Skip the current song when right-clicking the bot in voice channel."""
+    if not interaction.guild:
+        await interaction.response.send_message(get_messages("command.error.guild_only", interaction.guild_id), ephemeral=True, silent=SILENT_MESSAGES)
+        return
+    
+    if member.id != bot.user.id or not member.bot:
+        embed = Embed(
+            description="These commands can only be used on Playify bot. Right-click on the bot in the voice channel to use these controls.",
+            color=0xFF9AA2 if get_mode(interaction.guild_id) else discord.Color.red()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+        return
+
+    guild_id = interaction.guild_id
+    state = get_guild_state(guild_id)
+    is_kawaii = (state.locale == Locale.EN_X_KAWAII)
+    music_player = state.music_player
+    voice_client = interaction.guild.voice_client
+
+    if not voice_client or not (voice_client.is_playing() or voice_client.is_paused()):
+        embed = Embed(
+            description=get_messages("no_song", guild_id),
+            color=0xFF9AA2 if is_kawaii else discord.Color.red()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    if music_player.lyrics_task and not music_player.lyrics_task.done():
+        music_player.lyrics_task.cancel()
+
+    if music_player.loop_current:
+        await safe_stop(voice_client)
+    else:
+        music_player.manual_stop = True
+        await safe_stop(voice_client)
+
+    embed = Embed(
+        description=get_messages("player.skip.confirmation", guild_id),
+        color=0xB5EAD7 if is_kawaii else discord.Color.green()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+
+@bot.tree.context_menu(name="Volume Up")
+async def volume_up_context(interaction: discord.Interaction, member: discord.Member):
+    """Increase volume when right-clicking the bot in voice channel."""
+    if not interaction.guild:
+        await interaction.response.send_message(get_messages("command.error.guild_only", interaction.guild_id), ephemeral=True, silent=SILENT_MESSAGES)
+        return
+    
+    if member.id != bot.user.id or not member.bot:
+        embed = Embed(
+            description="These commands can only be used on Playify bot. Right-click on the bot in the voice channel to use these controls.",
+            color=0xFF9AA2 if get_mode(interaction.guild_id) else discord.Color.red()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = interaction.guild_id
+    state = get_guild_state(guild_id)
+    is_kawaii = (state.locale == Locale.EN_X_KAWAII)
+    music_player = state.music_player
+    voice_client = interaction.guild.voice_client
+
+    if not voice_client:
+        embed = Embed(
+            description=get_messages("no_playback", guild_id),
+            color=0xFF9AA2 if is_kawaii else discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+        return
+
+    new_volume = min(2.0, music_player.volume + 0.1)
+    music_player.volume = new_volume
+    if voice_client.source and isinstance(voice_client.source, discord.PCMVolumeTransformer):
+        voice_client.source.volume = new_volume
+
+    volume_percent = int(new_volume * 100)
+    embed = Embed(
+        description=get_messages("volume_success", guild_id, level=volume_percent),
+        color=0xB5EAD7 if is_kawaii else discord.Color.green()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+    bot.loop.create_task(update_controller(bot, interaction.guild.id))
+
+@bot.tree.context_menu(name="Volume Down")
+async def volume_down_context(interaction: discord.Interaction, member: discord.Member):
+    """Decrease volume when right-clicking the bot in voice channel."""
+    if not interaction.guild:
+        await interaction.response.send_message(get_messages("command.error.guild_only", interaction.guild_id), ephemeral=True, silent=SILENT_MESSAGES)
+        return
+    
+    if member.id != bot.user.id or not member.bot:
+        embed = Embed(
+            description="These commands can only be used on Playify bot. Right-click on the bot in the voice channel to use these controls.",
+            color=0xFF9AA2 if get_mode(interaction.guild_id) else discord.Color.red()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = interaction.guild_id
+    state = get_guild_state(guild_id)
+    is_kawaii = (state.locale == Locale.EN_X_KAWAII)
+    music_player = state.music_player
+    voice_client = interaction.guild.voice_client
+
+    if not voice_client:
+        embed = Embed(
+            description=get_messages("no_playback", guild_id),
+            color=0xFF9AA2 if is_kawaii else discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+        return
+
+    new_volume = max(0, music_player.volume - 0.1)
+    music_player.volume = new_volume
+    if voice_client.source and isinstance(voice_client.source, discord.PCMVolumeTransformer):
+        voice_client.source.volume = new_volume
+
+    volume_percent = int(new_volume * 100)
+    embed = Embed(
+        description=get_messages("volume_success", guild_id, level=volume_percent),
+        color=0xB5EAD7 if is_kawaii else discord.Color.green()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+    bot.loop.create_task(update_controller(bot, interaction.guild.id))
+
+@bot.tree.context_menu(name="Toggle Loop")
+async def loop_context(interaction: discord.Interaction, member: discord.Member):
+    """Toggle loop mode when right-clicking the bot in voice channel."""
+    if not interaction.guild:
+        await interaction.response.send_message(get_messages("command.error.guild_only", interaction.guild_id), ephemeral=True, silent=SILENT_MESSAGES)
+        return
+    
+    if member.id != bot.user.id or not member.bot:
+        embed = Embed(
+            description="These commands can only be used on Playify bot. Right-click on the bot in the voice channel to use these controls.",
+            color=0xFF9AA2 if get_mode(interaction.guild_id) else discord.Color.red()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    guild_id = interaction.guild_id
+    state = get_guild_state(guild_id)
+    is_kawaii = (state.locale == Locale.EN_X_KAWAII)
+    music_player = state.music_player
+
+    music_player.loop_current = not music_player.loop_current
+    state = get_messages("loop_state_enabled", guild_id) if music_player.loop_current else get_messages("loop_state_disabled", guild_id)
+    
+    embed = Embed(
+        description=get_messages("loop", guild_id, state=state),
+        color=0xB5EAD7 if is_kawaii else discord.Color.green()
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+    bot.loop.create_task(update_controller(bot, interaction.guild.id))
                 
 # ==============================================================================
 # 6. DISCORD EVENTS
