@@ -45,6 +45,37 @@ import sqlite3
 from dotenv import load_dotenv
 load_dotenv()
 
+# --- FFmpeg Detection ---
+def setup_ffmpeg():
+    """Setup FFmpeg path for standalone execution."""
+    import shutil
+    # Check if ffmpeg is in PATH
+    if shutil.which('ffmpeg'):
+        return True
+    
+    # Check common locations
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    possible_paths = [
+        base_path,
+        os.path.join(base_path, "ffmpeg"),
+        os.path.join(base_path, "bin"),
+        os.path.join(base_path, "app", "bin"),
+        os.path.join(base_path, "app", "ffmpeg"),
+    ]
+    
+    for path in possible_paths:
+        ffmpeg_exe = os.path.join(path, "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg")
+        if os.path.exists(ffmpeg_exe):
+            os.environ["PATH"] = path + os.pathsep + os.environ.get("PATH", "")
+            logger.info(f"FFmpeg found at: {ffmpeg_exe}")
+            return True
+    
+    logger.warning("FFmpeg not found! Audio playback will not work.")
+    logger.warning("Please install FFmpeg and ensure it's in your PATH or in the bot directory.")
+    return False
+
+setup_ffmpeg()
+
 def init_db():
     """Initialize the SQLite database and create tables if they do not exist."""
     conn = sqlite3.connect('playify_state.db')
@@ -4066,55 +4097,75 @@ async def play_autocomplete(interaction: discord.Interaction, current: str) -> l
     # --- FIN DE LA CORRECTION ---
 
     try:
-        # Uses a quick search on SoundCloud to get suggestions.
-        # "extract_flat": True is crucial for the search to be very fast.
-        sanitized_query = sanitize_query(current)
-        search_prefix = "scsearch10:" if IS_PUBLIC_VERSION else "ytsearch10:"
-        search_query = f"{search_prefix}{sanitized_query}" # Search for up to 10 results on SoundCloud
-        
-        info = await fetch_video_info_with_retry(
-            search_query, 
-            ydl_opts_override={"extract_flat": True, "noplaylist": True}
-        )
+        # Add timeout to prevent expired interactions
+        # Autocomplete has a 3-second timeout from Discord
+        try:
+            # Uses a quick search on SoundCloud to get suggestions.
+            # "extract_flat": True is crucial for the search to be very fast.
+            sanitized_query = sanitize_query(current)
+            search_prefix = "scsearch10:" if IS_PUBLIC_VERSION else "ytsearch10:"
+            search_query = f"{search_prefix}{sanitized_query}" # Search for up to 10 results on SoundCloud
+            
+            # Use asyncio.wait_for to ensure we don't exceed Discord's 3-second autocomplete timeout
+            info = await asyncio.wait_for(
+                fetch_video_info_with_retry(
+                    search_query, 
+                    ydl_opts_override={"extract_flat": True, "noplaylist": True}
+                ),
+                timeout=2.5  # Leave 0.5s buffer for processing
+            )
 
-        choices = []
-        if "entries" in info and info["entries"]:
-            for entry in info.get("entries", []):
-                title = entry.get('title', 'Unknown Title')
-                # We prioritize the 'webpage_url' (visible to the user) over the 'url' (which can be an API URL).
-                url = entry.get('webpage_url', entry.get('url'))
-                duration_seconds = entry.get('duration') # yt-dlp often provides the duration even in "flat" mode
-                
-                # Ensures that we have a title and a URL
-                if title and url:
-                    display_name = title
-                    # Add the duration to the title if it's available
-                    if duration_seconds:
-                        formatted_duration = format_duration(duration_seconds)
-                        display_name = f"{title} - {formatted_duration}"
+            choices = []
+            if "entries" in info and info["entries"]:
+                for entry in info.get("entries", [])[:25]:  # Limit to 25 choices (Discord max)
+                    title = entry.get('title', 'Unknown Title')
+                    # We prioritize the 'webpage_url' (visible to the user) over the 'url' (which can be an API URL).
+                    url = entry.get('webpage_url', entry.get('url'))
+                    duration_seconds = entry.get('duration') # yt-dlp often provides the duration even in "flat" mode
+                    
+                    # Ensures that we have a title and a URL
+                    if title and url:
+                        display_name = title
+                        # Add the duration to the title if it's available
+                        if duration_seconds:
+                            formatted_duration = format_duration(duration_seconds)
+                            display_name = f"{title} - {formatted_duration}"
 
-                    if len(display_name) > 100:
-                        display_name = display_name[:97] + "..."
+                        if len(display_name) > 100:
+                            display_name = display_name[:97] + "..."
 
-                    # THE FIX: Ensure the 'value' never exceeds 100 characters.
-                    # If the URL is short enough, use it for precision.
-                    # Otherwise, fall back to the title (truncated) as a search query.
-                    choice_value = url if len(url) <= 100 else title[:100]
+                        # THE FIX: Ensure the 'value' never exceeds 100 characters.
+                        # If the URL is short enough, use it for precision.
+                        # Otherwise, fall back to the title (truncated) as a search query.
+                        choice_value = url if len(url) <= 100 else title[:100]
 
-                    choices.append(app_commands.Choice(name=display_name, value=choice_value))
-        
-        return choices
+                        choices.append(app_commands.Choice(name=display_name, value=choice_value))
+            
+            return choices
+        except asyncio.TimeoutError:
+            logger.debug(f"Autocomplete timeout for '{current}'")
+            return []  # Return empty on timeout
+        except (discord.errors.NotFound, discord.errors.HTTPException) as e:
+            # Interaction expired or already acknowledged - silently ignore
+            logger.debug(f"Autocomplete interaction expired for '{current}': {e}")
+            return []
 
     except Exception as e:
-        logger.error(f"Autocomplete search for '{current}' failed: {e}")
+        logger.debug(f"Autocomplete search for '{current}' failed: {e}")
         return [] # Returns an empty list on error
     
 @bot.tree.command(name="play", description="Play a link or search for a song")
 @app_commands.describe(query="Link or title of the song/video to play")
 @app_commands.autocomplete(query=play_autocomplete)
 async def play(interaction: discord.Interaction, query: str):
-    if not interaction.guild:
-        await interaction.response.send_message(get_messages("command.error.guild_only", interaction.guild_id), ephemeral=True)
+    # Check if interaction is still valid
+    try:
+        if not interaction.guild:
+            await interaction.response.send_message(get_messages("command.error.guild_only", interaction.guild_id), ephemeral=True)
+            return
+    except (discord.errors.NotFound, discord.errors.HTTPException):
+        # Interaction already expired
+        logger.debug("Play command interaction expired before processing")
         return
 
     guild_id = interaction.guild.id
@@ -4123,8 +4174,13 @@ async def play(interaction: discord.Interaction, query: str):
     state = get_guild_state(guild_id)
     music_player = state.music_player
 
-    if not interaction.response.is_done():
-        await interaction.response.defer()
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+    except (discord.errors.NotFound, discord.errors.HTTPException) as e:
+        # Interaction expired - user will need to try again
+        logger.debug(f"Interaction expired before play command could respond: {e}")
+        return
 
     if IS_PUBLIC_VERSION and re.search(r'youtube\.com|youtu\.be|music\.youtube\.com', query):
         await show_youtube_blocked_message(interaction)

@@ -151,8 +151,8 @@ This is the easiest way to get the bot running.
 <a id="public-bot"></a>
 ## (＾▽＾) Use the Public Bot (No setup needed!)
 
-If you don’t want to self-host Playify, you can invite the **public Playify bot** hosted by me directly to your server!  
-Check it out and add it easily here: [https://cthede11.github.io/playify/](https://cthede11.github.io/playify/)
+If you don’t want to self-host Playify, you can invite the **public Playify bot** hosted by alan7383 directly to your server!  
+Check it out and add it easily here: [https://alan7383.github.io/playify/](https://alan7383.github.io/playify/)
 
 This way, you get all the great Playify features without any installation or configuration hassle!
 
@@ -212,6 +212,13 @@ This way, you get all the great Playify features without any installation or con
 *   Support the project to help cover hosting costs and encourage development:
     *   Become a Patron on [Patreon](https://patreon.com/Playify) for special perks and to show your ongoing support!
     *   [Donate via PayPal](https://www.paypal.com/paypalme/alanmussot1) for a one-time contribution.
+
+<a id="fork-attribution"></a>
+## (✿◕‿◕) Fork & Attribution
+
+This repository is a fork of the original Playify project created and maintained by [alan7383](https://github.com/alan7383). I am forking and building on their work adding packaging, Windows tooling, and other improvements to make self-hosting easier. The core bot and original implementation remain the work of the original author.
+
+If you'd like to report issues, contribute, or reference the upstream project, please also check the original repository at `https://github.com/alan7383/playify`.
 
 <a id="license"></a>
 ## (＾ω＾) License
