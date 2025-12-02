@@ -1,12 +1,12 @@
 # requirements.txt
 
 pyinstaller
-discord.py
+discord.py>=2.3.0
 PyNaCl
 zstandard
 customtkinter
 python-dotenv
-yt-dlp
+yt-dlp>=2023.12.30
 spotipy
 spotifyscraper[all]
 cachetools

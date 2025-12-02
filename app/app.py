@@ -267,7 +267,13 @@ class App(ctk.CTk):
         try:
             status = self.status_queue.get_nowait()
             if isinstance(self.current_page, StylishDashboardPage):
-                self.current_page.update_status(status)
+                # Handle UPDATE_AVAILABLE status from bot
+                if status == "UPDATE_AVAILABLE":
+                    # Bot detected update and waited for playback to finish
+                    # Trigger GUI app's update check to download and install
+                    self.check_for_updates(manual_check=False)
+                else:
+                    self.current_page.update_status(status)
         except queue.Empty:
             pass
         self.after(1000, self.check_bot_status)
@@ -511,7 +517,24 @@ class UpdatePromptWindow(ctk.CTkToplevel):
         self.progress_details.configure(text=f"{progress_percent:.1f}%  ({downloaded_mb:.2f} MB / {total_mb:.2f} MB)")
 
     def download_and_install(self):
+        backup_created = False
         try:
+            # Create backup of current installation before updating
+            try:
+                if getattr(sys, 'frozen', False):
+                    # For compiled app, backup the executable directory
+                    current_exe_dir = os.path.dirname(sys.executable)
+                    backup_dir = current_exe_dir + ".bak"
+                    if os.path.exists(backup_dir):
+                        import shutil
+                        shutil.rmtree(backup_dir)
+                    import shutil
+                    shutil.copytree(current_exe_dir, backup_dir)
+                    backup_created = True
+                    print(f"Backup created at: {backup_dir}")
+            except Exception as backup_error:
+                print(f"Warning: Could not create backup: {backup_error}")
+            
             temp_dir = tempfile.gettempdir()
             filename = self.download_url.split('/')[-1]
             if not filename:
@@ -520,28 +543,51 @@ class UpdatePromptWindow(ctk.CTkToplevel):
 
             print(f"Starting download of {self.download_url} to {setup_path}")
 
-            with requests.get(self.download_url, stream=True, timeout=60) as r:
-                r.raise_for_status()
-                total_size = int(r.headers.get('content-length', 0))
-                bytes_downloaded = 0
-                last_progress_int = -1
+            try:
+                with requests.get(self.download_url, stream=True, timeout=60) as r:
+                    r.raise_for_status()
+                    total_size = int(r.headers.get('content-length', 0))
+                    bytes_downloaded = 0
+                    last_progress_int = -1
 
-                with open(setup_path, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            bytes_downloaded += len(chunk)
-                            if total_size > 0:
-                                progress = (bytes_downloaded / total_size) * 100
-                                current_progress_int = int(progress)
-                                if current_progress_int > last_progress_int:
-                                    downloaded_mb = bytes_downloaded / 1e6
-                                    total_mb_float = total_size / 1e6
-                                    self.after(0, self.update_progress, progress, downloaded_mb, total_mb_float)
-                                    last_progress_int = current_progress_int
+                    with open(setup_path, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                bytes_downloaded += len(chunk)
+                                if total_size > 0:
+                                    progress = (bytes_downloaded / total_size) * 100
+                                    current_progress_int = int(progress)
+                                    if current_progress_int > last_progress_int:
+                                        downloaded_mb = bytes_downloaded / 1e6
+                                        total_mb_float = total_size / 1e6
+                                        self.after(0, self.update_progress, progress, downloaded_mb, total_mb_float)
+                                        last_progress_int = current_progress_int
 
-            print("Download complete. Scheduling installer launch.")
-            self.after(100, self._launch_installer_and_exit, setup_path)
+                    print("Download complete. Scheduling installer launch.")
+                    self.after(100, self._launch_installer_and_exit, setup_path)
+            except requests.exceptions.RequestException as e:
+                # Handle network errors and rate limits
+                error_msg = str(e)
+                if "403" in error_msg or "rate limit" in error_msg.lower():
+                    print("GitHub API rate limited. Skipping auto-update.")
+                    self.after(0, self._handle_update_error, "Update check rate limited. Please try again later.")
+                else:
+                    print(f"Failed to download update: {e}")
+                    self.after(0, self._handle_update_error, f"Download Error: {e}")
+                # Restore backup if download failed and backup exists
+                if backup_created:
+                    try:
+                        current_exe_dir = os.path.dirname(sys.executable)
+                        backup_dir = current_exe_dir + ".bak"
+                        if os.path.exists(backup_dir):
+                            import shutil
+                            if os.path.exists(current_exe_dir):
+                                shutil.rmtree(current_exe_dir)
+                            shutil.copytree(backup_dir, current_exe_dir)
+                            print("Restored from backup due to download failure.")
+                    except Exception as restore_error:
+                        print(f"Warning: Could not restore from backup: {restore_error}")
 
         except Exception as e:
             print(f"Failed to download update: {e}")

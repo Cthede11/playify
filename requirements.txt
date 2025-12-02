@@ -1,9 +1,9 @@
 # Core Discord library and voice dependency
-git+https://github.com/Rapptz/discord.py
+discord.py>=2.3.0
 PyNaCl
 
 # Audio/Video downloading
-git+https://github.com/yt-dlp/yt-dlp.git
+yt-dlp>=2023.12.30
 
 # Music platform APIs and scrapers
 spotipy
@@ -12,8 +12,9 @@ requests
 syncedlyrics
 lyricsgenius
 playwright
-python-dotenv  # <-- NEW
+python-dotenv
 
 # Utilities
 cachetools
 psutil
+packaging  # For version comparison in auto-update

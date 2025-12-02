@@ -44,6 +44,7 @@ import sqlite3
 import nacl
 from queue import Empty
 from dotenv import load_dotenv
+from packaging.version import parse as parse_version
 
 def run_nacl_diagnostics():
     # On utilise le même dossier AppData pour trouver le log facilement
@@ -78,6 +79,11 @@ def run_nacl_diagnostics():
 APP_DATA_DIR = os.path.join(os.getenv('LOCALAPPDATA'), "Playify")
 DB_PATH = os.path.join(APP_DATA_DIR, 'playify_state.db')
 os.makedirs(APP_DATA_DIR, exist_ok=True)
+
+# Auto-update configuration
+CURRENT_VERSION = "1.3.0"  # Must match app.py version
+UPDATE_REPO_URL = "https://api.github.com/repos/Cthede11/playify/releases/latest"
+UPDATE_CHECK_INTERVAL = 3600  # Check every hour (3600 seconds)
 
 
 def init_db():
@@ -231,6 +237,13 @@ controller_channels = {} # {guild_id: channel_id}
 controller_messages = {} # {guild_id: message_id}
 allowed_channels_map = {} # {guild_id: set(channel_id, ...)}
 
+# Track metadata cache: maxsize=500 entries, ttl=3600 seconds (1 hour)
+# Cache key: normalized URL or query string, value: full track metadata dict
+track_metadata_cache = TTLCache(maxsize=500, ttl=3600)
+
+# FFmpeg process tracking: limit concurrent processes to prevent CPU thrash
+active_ffmpeg_processes = {}  # {guild_id: process} - tracks active FFmpeg processes per guild
+MAX_CONCURRENT_FFMPEG = 10  # Maximum concurrent FFmpeg processes across all guilds
 
 # This global variable will be initialized inside run_bot
 process_pool = None
@@ -1681,7 +1694,16 @@ async def fetch_video_info_with_retry(query: str, ydl_opts_override=None):
         """
         Fetches video info using yt-dlp, with a robust retry mechanism for age-restricted content.
         This is the new universal function for all online fetching.
+        Includes caching to reduce redundant API calls.
         """
+        # Normalize query for cache key (strip whitespace, lowercase URLs)
+        cache_key = query.strip().lower() if query.startswith(('http://', 'https://')) else query.strip()
+        
+        # Check cache first
+        if cache_key in track_metadata_cache:
+            logger.info(f"Cache hit for '{query[:100]}'")
+            return track_metadata_cache[cache_key]
+        
         base_ydl_opts = {
             "format": "bestaudio[acodec=opus]/bestaudio/best",
             "quiet": True, "no_warnings": True, "no_color": True, "socket_timeout": 15,
@@ -1691,7 +1713,13 @@ async def fetch_video_info_with_retry(query: str, ydl_opts_override=None):
         try:
             # First attempt: no cookies
             logger.info(f"Fetching info for '{query[:100]}' (no cookies).")
-            return await run_ydl_with_low_priority(ydl_opts, query)
+            result = await run_ydl_with_low_priority(ydl_opts, query)
+            
+            # Cache the result
+            if result:
+                track_metadata_cache[cache_key] = result
+            
+            return result
         except yt_dlp.utils.DownloadError as e:
             error_str = str(e).lower()
             # Check for age restriction errors
@@ -1704,7 +1732,13 @@ async def fetch_video_info_with_retry(query: str, ydl_opts_override=None):
                 for cookie_name in cookies_to_try:
                     try:
                         logger.info(f"Retrying with cookie: {cookie_name}")
-                        return await run_ydl_with_low_priority(ydl_opts, query, specific_cookie_file=cookie_name)
+                        result = await run_ydl_with_low_priority(ydl_opts, query, specific_cookie_file=cookie_name)
+                        
+                        # Cache the result
+                        if result:
+                            track_metadata_cache[cache_key] = result
+                        
+                        return result
                     except Exception as cookie_e:
                         logger.warning(f"Cookie '{cookie_name}' failed: {str(cookie_e)[:150]}")
                         continue # Try the next cookie
@@ -1872,6 +1906,9 @@ def run_bot(status_queue, log_queue, command_queue):
         process_pool = ProcessPoolExecutor(max_workers=psutil.cpu_count(logical=False))
     except (NotImplementedError, AttributeError):
         process_pool = ProcessPoolExecutor(max_workers=os.cpu_count())
+    
+    # Track active views per guild to disable stale buttons
+    active_views = {}  # {guild_id: {view_type: (view, message_id)}}
 
     # --- Début de la fonction run_bot ---
 
@@ -2026,25 +2063,6 @@ def run_bot(status_queue, log_queue, command_queue):
             self.silence_management_lock = asyncio.Lock()
             self.is_paused_by_leave = False
             self.manual_stop = False 
-
-    async def command_checker():
-        """Checks if the application has sent a command."""
-        while not bot.is_closed():  # As long as the bot is running
-            try:
-                # Try to get a message from the intercom, without blocking
-                command = command_queue.get_nowait()
-                
-                # If the message is "RESTART" or "QUIT"
-                if command in ['RESTART', 'QUIT']:
-                    logger.info(f"Command received: {command}. Shutting down gracefully.")
-                    
-                    # Initiate the bot's GRACEFUL shutdown procedure
-                    await bot.close()  # This is where the save is triggered!
-                    break  # Stop listening
-                    
-            except Empty:
-                # If there is no message, wait 1s and listen again
-                await asyncio.sleep(1)
 
     async def command_checker():
         """Checks if the application has sent a command."""
@@ -2651,8 +2669,8 @@ def run_bot(status_queue, log_queue, command_queue):
 
         # Active state (music playing)
         info = music_player.current_info
-        # Truncate long titles to prevent errors
-        title = info.get("title", "Unknown Title")
+        # Truncate long titles to prevent errors and sanitize mentions
+        title = sanitize_mentions(info.get("title", "Unknown Title"))
         if len(title) > 80: title = title[:77] + "..."
         
         thumbnail = info.get("thumbnail")
@@ -2735,10 +2753,40 @@ def run_bot(status_queue, log_queue, command_queue):
         embed.add_field(name=get_messages("controller_next_up_field", guild_id), value=next_song_text, inline=False)
         
         now_playing_title_display = f"**[{title}]({info.get('webpage_url', info.get('url', '#'))})**" if info.get('source_type') != 'file' else f"💿 `{title}`"
-        now_playing_value = f"{now_playing_title_display}\n> 🎤 **{artist}**\n\nRequested by: {requester.mention}\nConnected in: 🔊 | {vc.channel.name}"
+        # Sanitize artist name to prevent mention spam
+        artist_safe = sanitize_mentions(artist)
+        now_playing_value = f"{now_playing_title_display}\n> 🎤 **{artist_safe}**\n\nRequested by: {requester.mention}\nConnected in: 🔊 | {vc.channel.name}"
         embed.add_field(name=get_messages("controller_now_playing_field", guild_id), value=now_playing_value, inline=False)
         
-        if thumbnail: embed.set_thumbnail(url=thumbnail)
+        # Set song thumbnail dynamically, fallback to Playify logo
+        thumbnail_url = None
+        if info.get('source_type') != 'file':
+            # Try to get video_id for YouTube
+            video_id = info.get('id')
+            webpage_url = info.get('webpage_url') or info.get('url', '')
+            
+            # Extract video_id from YouTube URL if not in info
+            if not video_id and webpage_url:
+                if 'youtube.com' in webpage_url or 'youtu.be' in webpage_url:
+                    parsed = urlparse(webpage_url)
+                    if parsed.hostname == 'youtu.be':
+                        video_id = parsed.path[1:]
+                    elif parsed.path == '/watch':
+                        query = parse_qs(parsed.query)
+                        video_id = query.get('v', [None])[0]
+            
+            # Use YouTube thumbnail if we have video_id
+            if video_id:
+                thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+            # Fallback to thumbnail from yt-dlp
+            elif thumbnail:
+                thumbnail_url = thumbnail
+        
+        # Set image (use thumbnail if available, otherwise fallback to Playify logo)
+        if thumbnail_url:
+            embed.set_image(url=thumbnail_url)
+        else:
+            embed.set_image(url="https://i.imgur.com/vDusBWD.png")
 
         status_lines = []
         if music_player.loop_current: status_lines.append(get_messages("queue_status_loop", guild_id))
@@ -3479,6 +3527,31 @@ def run_bot(status_queue, log_queue, command_queue):
                 music_player.seek_info = elapsed_time
                 await safe_stop(music_player.voice_client)
 
+    async def disable_stale_view(guild_id: int, view_type: str):
+        """Disable buttons on old view instances to prevent stale interactions."""
+        if guild_id not in active_views:
+            active_views[guild_id] = {}
+        
+        old_view_data = active_views[guild_id].get(view_type)
+        if old_view_data:
+            old_view, old_message_id = old_view_data
+            try:
+                # Disable all buttons in the old view
+                for item in old_view.children:
+                    if hasattr(item, 'disabled'):
+                        item.disabled = True
+                
+                # Try to update the old message to disable buttons
+                try:
+                    channel = bot.get_channel(old_view.interaction.channel_id) if hasattr(old_view, 'interaction') else None
+                    if channel:
+                        old_message = await channel.fetch_message(old_message_id)
+                        await old_message.edit(view=old_view)
+                except (discord.NotFound, discord.Forbidden, AttributeError):
+                    pass  # Message may have been deleted or we don't have access
+            except Exception as e:
+                logger.debug(f"Could not disable stale view: {e}")
+
     class QueueView(View):
         """
         A View that handles pagination for the /queue command.
@@ -4103,21 +4176,27 @@ def run_bot(status_queue, log_queue, command_queue):
     async def safe_stop(vc: discord.VoiceClient):
         """
         Stops the voice client and forcefully kills the underlying FFMPEG process
-        to prevent zombie processes.
+        to prevent zombie processes. Also cleans up process tracking.
         """
+        guild_id = vc.guild.id if vc and vc.guild else None
+        
         if vc and (vc.is_playing() or vc.is_paused()):
             # Force kill the FFMPEG process
             if isinstance(vc.source, discord.PCMAudio) and hasattr(vc.source, 'process'):
                 try:
                     vc.source.process.kill()
-                    logger.info(f"[{vc.guild.id}] Manually killed FFMPEG process via safe_stop.")
+                    logger.info(f"[{guild_id}] Manually killed FFMPEG process via safe_stop.")
                 except Exception as e:
-                    logger.error(f"[{vc.guild.id}] Error killing FFMPEG in safe_stop: {e}")
+                    logger.error(f"[{guild_id}] Error killing FFMPEG in safe_stop: {e}")
             
             # Also call discord.py's stop() to clean up its internal state
             vc.stop()
             # A tiny delay to ensure the OS has time to process the kill signal
             await asyncio.sleep(0.1)
+        
+        # Clean up process tracking
+        if guild_id and guild_id in active_ffmpeg_processes:
+            del active_ffmpeg_processes[guild_id]
 
     def create_queue_item_from_info(info: dict) -> dict:
         """
@@ -4393,16 +4472,21 @@ def run_bot(status_queue, log_queue, command_queue):
             return f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
         return None
 
-    def get_soundcloud_track_id(url):
+    async def get_soundcloud_track_id(url):
         if "soundcloud.com" in url:
             try:
                 ydl_opts = {
                     "quiet": True,
                     "no_warnings": True,
                 }
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    return info.get("id")
+                # Offload blocking yt-dlp extraction to thread pool
+                loop = asyncio.get_running_loop()
+                def extract_info_sync():
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        return ydl.extract_info(url, download=False)
+                
+                info = await asyncio.to_thread(extract_info_sync)
+                return info.get("id") if info else None
             except Exception:
                 return None
         return None
@@ -4491,6 +4575,16 @@ def run_bot(status_queue, log_queue, command_queue):
             return
 
         async def after_playing(error):
+            # Clean up temp files after playback
+            if music_player.current_info and music_player.current_info.get('_temp_file'):
+                file_path = music_player.current_info.get('url')
+                if file_path and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                        logger.info(f"Cleaned up temp file: {file_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to clean up temp file {file_path}: {e}")
+            
             if error:
                 logger.error(f'Error after playing in guild {guild_id}: {error}')
             
@@ -4594,7 +4688,7 @@ def run_bot(status_queue, log_queue, command_queue):
                                             current_video_id = get_video_id(seed_url)
                                             recommendations = [entry for entry in info["entries"] if entry and get_video_id(entry.get("url", "")) != current_video_id][:50]
                                 elif "soundcloud.com" in seed_url:
-                                    track_id = get_soundcloud_track_id(seed_url)
+                                    track_id = await get_soundcloud_track_id(seed_url)
                                     station_url = get_soundcloud_station_url(track_id)
                                     if station_url:
                                         info = await run_ydl_with_low_priority({"extract_flat": True, "quiet": True, "noplaylist": False}, station_url)
@@ -4728,18 +4822,83 @@ def run_bot(status_queue, log_queue, command_queue):
             if filter_chain:
                 ffmpeg_options["options"] = f"{ffmpeg_options.get('options', '')} -af \"{filter_chain}\"".strip()
             
+            # Check and limit concurrent FFmpeg processes
+            current_ffmpeg_count = len([p for p in active_ffmpeg_processes.values() if p and p.poll() is None])
+            if current_ffmpeg_count >= MAX_CONCURRENT_FFMPEG:
+                logger.warning(f"[{guild_id}] Maximum concurrent FFmpeg processes reached ({MAX_CONCURRENT_FFMPEG}). Waiting...")
+                # Wait a bit and retry, or skip this track
+                await asyncio.sleep(1)
+                current_ffmpeg_count = len([p for p in active_ffmpeg_processes.values() if p and p.poll() is None])
+                if current_ffmpeg_count >= MAX_CONCURRENT_FFMPEG:
+                    logger.error(f"[{guild_id}] Still at max FFmpeg processes. Skipping track.")
+                    bot.loop.create_task(play_audio(guild_id, song_that_just_ended=music_player.current_info))
+                    return
+            
             source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(audio_url, **ffmpeg_options), volume=music_player.volume)
             
-            callback = lambda e: bot.loop.create_task(after_playing(e))
+            # Track FFmpeg process
+            def cleanup_ffmpeg_process(error):
+                """Cleanup callback that removes process from tracking"""
+                if guild_id in active_ffmpeg_processes:
+                    del active_ffmpeg_processes[guild_id]
+                # Call original callback
+                bot.loop.create_task(after_playing(error))
+            
+            callback = cleanup_ffmpeg_process
             
             if not music_player.voice_client or not music_player.voice_client.is_connected():
                 logger.warning(f"[{guild_id}] Playback canceled at the last moment: voice client is no longer valid.")
                 return
 
             music_player.voice_client.play(source, after=callback)
+            
+            # Store FFmpeg process reference for tracking
+            if hasattr(source, 'original') and hasattr(source.original, 'process'):
+                active_ffmpeg_processes[guild_id] = source.original.process
+            elif hasattr(source, 'process'):
+                active_ffmpeg_processes[guild_id] = source.process
 
             music_player.start_time = seek_time
             music_player.playback_started_at = time.time()
+
+            # Prefetch next track's stream URL in background to eliminate dead air
+            async def prefetch_next_track():
+                try:
+                    # Peek at next item in queue without removing it
+                    if not music_player.queue.empty():
+                        # Get a snapshot of the queue
+                        queue_snapshot = []
+                        temp_items = []
+                        while not music_player.queue.empty():
+                            item = await music_player.queue.get()
+                            temp_items.append(item)
+                            queue_snapshot.append(item)
+                        
+                        # Put items back
+                        for item in temp_items:
+                            await music_player.queue.put(item)
+                        
+                        if queue_snapshot:
+                            next_item = queue_snapshot[0]
+                            # Only prefetch if it's not a file and not already a LazySearchItem
+                            if isinstance(next_item, dict) and next_item.get('source_type') != 'file':
+                                url_for_prefetch = next_item.get('webpage_url') or next_item.get('url')
+                                if url_for_prefetch:
+                                    try:
+                                        logger.info(f"[{guild_id}] Prefetching stream URL for next track: '{next_item.get('title', 'Unknown')}'")
+                                        prefetched_info = await fetch_video_info_with_retry(url_for_prefetch)
+                                        if prefetched_info and 'url' in prefetched_info:
+                                            # Update the queue item with prefetched URL
+                                            next_item.update(prefetched_info)
+                                            logger.info(f"[{guild_id}] Successfully prefetched next track stream URL")
+                                    except Exception as e:
+                                        logger.debug(f"[{guild_id}] Prefetch failed (non-critical): {e}")
+                except Exception as e:
+                    logger.debug(f"[{guild_id}] Prefetch error (non-critical): {e}")
+            
+            # Start prefetching in background (don't await)
+            if not is_a_loop:
+                bot.loop.create_task(prefetch_next_track())
 
             if guild_id in controller_channels and not is_a_loop and seek_time == 0:
                 channel_id = controller_channels.get(guild_id)
@@ -4837,7 +4996,18 @@ def run_bot(status_queue, log_queue, command_queue):
             return
 
         guild_id = interaction.guild_id
+        is_kawaii = get_mode(guild_id)
         music_player = get_player(guild_id)
+        
+        # Rate limiting check
+        is_on_cooldown, remaining = check_cooldown(interaction.user.id, "lyrics")
+        if is_on_cooldown:
+            embed = Embed(
+                description=f"Please wait {remaining:.1f} seconds before using this command again.",
+                color=0xFF9AA2 if is_kawaii else discord.Color.orange()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+            return
 
         if not music_player.voice_client or not music_player.voice_client.is_playing() or not music_player.current_info:
             return await interaction.response.send_message("No music is currently playing.", silent=SILENT_MESSAGES, ephemeral=True)
@@ -5015,6 +5185,65 @@ def run_bot(status_queue, log_queue, command_queue):
             logger.error(f"Autocomplete search for '{current}' failed: {e}")
             return [] # Returns an empty list on error
     
+    def validate_url(url: str) -> bool:
+        """Validate URL to prevent SSRF attacks. Only allows http/https protocols."""
+        try:
+            parsed = urlparse(url)
+            # Only allow http and https protocols
+            if parsed.scheme not in ('http', 'https'):
+                return False
+            # Block local IPs and private ranges
+            hostname = parsed.hostname
+            if not hostname:
+                return False
+            # Block localhost variants
+            if hostname in ('localhost', '127.0.0.1', '::1', '0.0.0.0'):
+                return False
+            # Block private IP ranges
+            if hostname.startswith('192.168.') or hostname.startswith('10.') or hostname.startswith('172.'):
+                return False
+            # Block file:// protocol (should be caught by scheme check, but double-check)
+            if 'file://' in url.lower():
+                return False
+            return True
+        except Exception:
+            return False
+    
+    def sanitize_mentions(text: str) -> str:
+        """Remove Discord mentions (@everyone, @here, @role) from external content."""
+        if not text:
+            return text
+        # Remove @everyone and @here
+        text = text.replace('@everyone', '@\u200beveryone')
+        text = text.replace('@here', '@\u200bhere')
+        # Remove role mentions (pattern: <@&role_id>)
+        text = re.sub(r'<@&\d+>', '', text)
+        return text
+
+    # Rate limiting for high-cost commands
+    command_cooldowns = {}  # {(user_id, command_name): last_used_timestamp}
+    COOLDOWN_TIMES = {
+        "play": 3,  # 3 seconds
+        "search": 3,  # 3 seconds
+        "lyrics": 5,  # 5 seconds
+    }
+    
+    def check_cooldown(user_id: int, command_name: str) -> tuple[bool, float]:
+        """Check if user is on cooldown. Returns (is_on_cooldown, remaining_seconds)."""
+        if command_name not in COOLDOWN_TIMES:
+            return False, 0
+        
+        key = (user_id, command_name)
+        last_used = command_cooldowns.get(key, 0)
+        cooldown_time = COOLDOWN_TIMES[command_name]
+        elapsed = time.time() - last_used
+        
+        if elapsed < cooldown_time:
+            return True, cooldown_time - elapsed
+        else:
+            command_cooldowns[key] = time.time()
+            return False, 0
+
     @bot.tree.command(name="play", description="Play a link or search for a song")
     @app_commands.describe(query="Link or title of the song/video to play")
     @app_commands.autocomplete(query=play_autocomplete)
@@ -5026,6 +5255,26 @@ def run_bot(status_queue, log_queue, command_queue):
         guild_id = interaction.guild.id
         is_kawaii = get_mode(guild_id)
         music_player = get_player(guild_id)
+
+        # Rate limiting check
+        is_on_cooldown, remaining = check_cooldown(interaction.user.id, "play")
+        if is_on_cooldown:
+            embed = Embed(
+                description=f"Please wait {remaining:.1f} seconds before using this command again.",
+                color=0xFF9AA2 if is_kawaii else discord.Color.orange()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+            return
+        
+        # Validate URL if it looks like one
+        if query.startswith(('http://', 'https://')):
+            if not validate_url(query):
+                embed = Embed(
+                    description="Invalid URL. Only http and https URLs are allowed.",
+                    color=0xFF9AA2 if is_kawaii else discord.Color.red()
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+                return
 
         if not interaction.response.is_done():
             await interaction.response.defer()
@@ -5162,24 +5411,45 @@ def run_bot(status_queue, log_queue, command_queue):
 
                 logger.info(f"[{guild_id}] Using fast, flat extraction for direct link/playlist: {url_to_fetch}")
                 ydl_opts_override = {"extract_flat": True, "noplaylist": False}
+                
+                # Acknowledge command immediately for better UX
+                if not interaction.response.is_done():
+                    await interaction.response.defer(thinking=True)
+                
                 info = await fetch_video_info_with_retry(url_to_fetch, ydl_opts_override=ydl_opts_override)
 
                 if "entries" in info and info["entries"]:
                     # This is a playlist (from YouTube, SoundCloud, etc.).
                     tracks_to_add = info["entries"]
-                    logger.info(f"[{guild_id}] Adding {len(tracks_to_add)} unhydrated tracks from a direct playlist.")
-                    for entry in tracks_to_add:
-                        await music_player.queue.put({
-                            'url': entry.get('url'),
-                            'title': entry.get('title', 'Loading...'), # Placeholder title
-                            'requester': interaction.user,
-                            'hydrated': False # Mark as needing metadata
-                        })
+                    total_count = len(tracks_to_add)
+                    logger.info(f"[{guild_id}] Adding {total_count} unhydrated tracks from a direct playlist (batch loading).")
+                    
+                    # Send immediate acknowledgment
                     embed = Embed(
                         title=get_messages("playlist_added", guild_id),
-                        description=get_messages("playlist_description", guild_id).format(count=len(tracks_to_add)),
+                        description=get_messages("playlist_description", guild_id).format(count=total_count),
                         color=0xB5EAD7 if is_kawaii else discord.Color.green())
                     await interaction.followup.send(embed=embed, silent=SILENT_MESSAGES)
+                    
+                    # Load tracks asynchronously in chunks to avoid blocking
+                    async def load_playlist_chunks():
+                        chunk_size = 50  # Process 50 tracks at a time
+                        for i in range(0, total_count, chunk_size):
+                            chunk = tracks_to_add[i:i + chunk_size]
+                            for entry in chunk:
+                                await music_player.queue.put({
+                                    'url': entry.get('url'),
+                                    'title': entry.get('title', 'Loading...'), # Placeholder title
+                                    'requester': interaction.user,
+                                    'hydrated': False # Mark as needing metadata
+                                })
+                            # Small delay between chunks to avoid overwhelming the system
+                            if i + chunk_size < total_count:
+                                await asyncio.sleep(0.1)
+                        logger.info(f"[{guild_id}] Finished loading {total_count} tracks into queue")
+                    
+                    # Start loading in background (don't await)
+                    bot.loop.create_task(load_playlist_chunks())
                 else:
                     # This is a single track. `info` is the video's data.
                     video_info = info
@@ -5250,40 +5520,78 @@ def run_bot(status_queue, log_queue, command_queue):
         if not voice_client:
             return
         
-        base_cache_dir = "audio_cache"
-        guild_cache_dir = os.path.join(base_cache_dir, str(guild_id))
-        os.makedirs(guild_cache_dir, exist_ok=True)
+        # Use temp directory with generated names for security
+        import tempfile
+        import uuid
+        
+        temp_dir = os.path.join(tempfile.gettempdir(), "playify_files", str(guild_id))
+        os.makedirs(temp_dir, exist_ok=True)
         
         attachments = [f for f in [file1, file2, file3, file4, file5, file6, file7, file8, file9, file10] if f is not None]
         
         added_files = []
         failed_files = []
+        saved_file_paths = []  # Track files for cleanup
+
+        def sanitize_filename(filename: str) -> str:
+            """Sanitize filename to prevent path traversal attacks."""
+            # Remove path components
+            filename = os.path.basename(filename)
+            # Remove any remaining path traversal attempts
+            filename = filename.replace('..', '').replace('/', '').replace('\\', '')
+            # Remove control characters
+            filename = re.sub(r'[\x00-\x1F\x7F]', '', filename)
+            # Limit length
+            if len(filename) > 255:
+                name, ext = os.path.splitext(filename)
+                filename = name[:250] + ext
+            return filename or "unnamed_file"
 
         for attachment in attachments:
             if not attachment.content_type or not (attachment.content_type.startswith("audio/") or attachment.content_type.startswith("video/")):
                 failed_files.append(attachment.filename)
                 continue
-                
-            file_path = os.path.join(guild_cache_dir, attachment.filename)
+            
+            # Sanitize filename and generate unique name
+            safe_filename = sanitize_filename(attachment.filename)
+            # Generate unique filename to prevent collisions
+            unique_id = str(uuid.uuid4())[:8]
+            name, ext = os.path.splitext(safe_filename)
+            if not ext:
+                # Try to get extension from content type
+                ext_map = {
+                    'audio/mpeg': '.mp3',
+                    'audio/wav': '.wav',
+                    'audio/ogg': '.ogg',
+                    'audio/mp4': '.m4a',
+                    'video/mp4': '.mp4',
+                    'video/webm': '.webm'
+                }
+                ext = ext_map.get(attachment.content_type, '.tmp')
+            generated_filename = f"{unique_id}_{name}{ext}"
+            file_path = os.path.join(temp_dir, generated_filename)
+            
             try:
                 await attachment.save(file_path)
-                logger.info(f"File saved for guild {guild_id}: {file_path}")
+                saved_file_paths.append(file_path)
+                logger.info(f"File saved for guild {guild_id}: {file_path} (original: {attachment.filename})")
                 
                 duration = get_file_duration(file_path)
 
                 queue_item = {
                     'url': file_path,
-                    'title': attachment.filename,
+                    'title': sanitize_mentions(safe_filename),  # Use sanitized filename
                     'webpage_url': None,
                     'thumbnail': None,
                     'is_single': True,
                     'source_type': 'file',
                     'duration': duration,
-                    'requester': interaction.user
+                    'requester': interaction.user,
+                    '_temp_file': True  # Mark for cleanup
                 }
                 
                 await music_player.queue.put(queue_item)
-                added_files.append(attachment.filename)
+                added_files.append(safe_filename)
 
                 if _24_7_active.get(guild_id, False):
                     music_player.radio_playlist.append(queue_item)
@@ -5311,64 +5619,107 @@ def run_bot(status_queue, log_queue, command_queue):
             music_player.current_task = asyncio.create_task(play_audio(guild_id))
 
     # /queue command
-    @bot.tree.command(name="queue", description="Show the current song queue and status with pages.")
-    async def queue(interaction: discord.Interaction):
-        if not interaction.guild:
-            await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True, silent=SILENT_MESSAGES)
-            return
-
-        await interaction.response.defer()
-        guild_id = interaction.guild.id
-        music_player = get_player(guild_id)
-
-        is_24_7_normal = _24_7_active.get(guild_id, False) and not music_player.autoplay_enabled
-        tracks_for_display = []
-        
-        if is_24_7_normal and music_player.radio_playlist:
-            current_url = music_player.current_info.get('url') if music_player.current_info else None
-            try:
-                current_index = [t.get('url') for t in music_player.radio_playlist].index(current_url)
-                tracks_for_display = music_player.radio_playlist[current_index + 1:] + music_player.radio_playlist[:current_index + 1]
-            except (ValueError, IndexError):
-                tracks_for_display = music_player.radio_playlist
-        else:
-            tracks_for_display = list(music_player.queue._queue)
-
-        if not tracks_for_display and not music_player.current_info:
-            is_kawaii = get_mode(guild_id)
-            embed = Embed(
-                description=get_messages("queue_empty", guild_id),
-                color=0xFF9AA2 if is_kawaii else discord.Color.red()
-            )
-            await interaction.followup.send(silent=SILENT_MESSAGES, embed=embed, ephemeral=True)
-            return
-
-        view = QueueView(interaction=interaction, tracks=tracks_for_display, items_per_page=5)
-        view.update_button_states()
-        initial_embed = await view.create_queue_embed()
-        message = await interaction.followup.send(embed=initial_embed, view=view, silent=SILENT_MESSAGES)
-        view.message = message
-
-    @bot.tree.command(name="clearqueue", description="Clear the current queue")
+    # Note: Old /queue command removed - use /queue show instead
+    # Old commands kept for backward compatibility but call grouped handlers
+    
+    @bot.tree.command(name="clearqueue", description="[Deprecated] Use /queue clear instead. Clear the current queue")
     async def clear_queue(interaction: discord.Interaction):
+        # Call the grouped handler
+        await queue_clear(interaction)
+
+    @bot.tree.command(name="settings", description="View and manage server settings")
+    @app_commands.describe(
+        setting="The setting to view or change",
+        value="The new value (for volume: 0-200)"
+    )
+    @app_commands.choices(setting=[
+        Choice(name="Volume", value="volume"),
+        Choice(name="View All Settings", value="view")
+    ])
+    async def settings(interaction: discord.Interaction, setting: str = "view", value: int = None):
         if not interaction.guild:
             await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True, silent=SILENT_MESSAGES)
             return
-
+        
         guild_id = interaction.guild_id
         is_kawaii = get_mode(guild_id)
         music_player = get_player(guild_id)
+        
+        if setting == "view":
+            # Show all current settings
+            volume_percent = int(music_player.volume * 100)
+            loop_status = "Enabled" if music_player.loop_current else "Disabled"
+            autoplay_status = "Enabled" if music_player.autoplay_enabled else "Disabled"
+            _24_7_status = "Enabled" if _24_7_active.get(guild_id, False) else "Disabled"
+            active_filters = server_filters.get(guild_id, set())
+            filter_list = ", ".join([FILTER_DISPLAY_NAMES.get(f, f) for f in active_filters]) if active_filters else "None"
+            
+            embed = Embed(
+                title="⚙️ Server Settings",
+                description=f"**Volume:** {volume_percent}%\n**Loop:** {loop_status}\n**Autoplay:** {autoplay_status}\n**24/7 Mode:** {_24_7_status}\n**Active Filters:** {filter_list}",
+                color=0xB5EAD7 if is_kawaii else discord.Color.blue()
+            )
+            embed.set_footer(text="Use /settings volume <value> to change volume (0-200%)")
+            await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+        elif setting == "volume":
+            if value is None:
+                await interaction.response.send_message("Please provide a volume value (0-200).", ephemeral=True, silent=SILENT_MESSAGES)
+                return
+            if not (0 <= value <= 200):
+                await interaction.response.send_message("Volume must be between 0 and 200.", ephemeral=True, silent=SILENT_MESSAGES)
+                return
+            
+            music_player.volume = value / 100.0
+            embed = Embed(
+                description=f"Volume set to {value}%",
+                color=0xB5EAD7 if is_kawaii else discord.Color.green()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+            bot.loop.create_task(update_controller(bot, guild_id))
 
-        bot.loop.create_task(update_controller(bot, interaction.guild.id))
-
-        while not music_player.queue.empty():
-            music_player.queue.get_nowait()
-
-        music_player.history.clear()
-        music_player.radio_playlist.clear()
-
-        embed = Embed(description=get_messages("clear_queue_success", guild_id), color=0xB5EAD7 if is_kawaii else discord.Color.green())
-        await interaction.response.send_message(silent=SILENT_MESSAGES,embed=embed)
+    @bot.tree.command(name="help", description="Get help and information about Playify")
+    async def help_command(interaction: discord.Interaction):
+        if not interaction.guild:
+            await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True, silent=SILENT_MESSAGES)
+            return
+        
+        guild_id = interaction.guild_id
+        is_kawaii = get_mode(guild_id)
+        
+        embed = Embed(
+            title="🎵 Playify Help",
+            description="A powerful Discord music bot with support for multiple platforms!",
+            color=0xB5EAD7 if is_kawaii else discord.Color.blue(),
+            url="https://github.com/Cthede11/playify"
+        )
+        embed.add_field(
+            name="📖 Documentation",
+            value="[View Full Documentation](https://alan7383.github.io/playify)",
+            inline=False
+        )
+        embed.add_field(
+            name="🎮 Basic Commands",
+            value="`/play` - Play music from links or search\n`/search` - Search and choose from results\n`/queue` - View the queue\n`/nowplaying` - Current track info",
+            inline=False
+        )
+        embed.add_field(
+            name="🎛️ Playback Controls",
+            value="`/pause` `/resume` `/skip` `/stop`\n`/seek` - Jump to position\n`/loop` - Loop current track\n`/autoplay` - Auto-add similar songs",
+            inline=False
+        )
+        embed.add_field(
+            name="⚙️ Settings",
+            value="`/settings` - View server settings\n`/volume` - Adjust volume\n`/filter` - Apply audio effects",
+            inline=False
+        )
+        embed.add_field(
+            name="🔗 Links",
+            value="[GitHub](https://github.com/Cthede11/playify) | [Support Server](https://discord.gg/JeH8g6g3cG)",
+            inline=False
+        )
+        embed.set_footer(text="Made with ❤️ by @alananasssss")
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
 
     @bot.tree.command(name="playnext", description="Add a song or a local file to play next")
     @app_commands.describe(
@@ -5857,8 +6208,10 @@ def run_bot(status_queue, log_queue, command_queue):
 
         music_player.loop_current = not music_player.loop_current
         state = get_messages("loop_state_enabled", guild_id) if music_player.loop_current else get_messages("loop_state_disabled", guild_id)
+        status_emoji = "✅" if music_player.loop_current else "❌"
 
         embed = Embed(
+            title=f"{status_emoji} Loop {state}",
             description=get_messages("loop", guild_id).format(state=state),
             color=0xC7CEEA if is_kawaii else discord.Color.blue()
         )
@@ -5963,8 +6316,10 @@ def run_bot(status_queue, log_queue, command_queue):
 
         music_player.autoplay_enabled = not music_player.autoplay_enabled
         state = get_messages("autoplay_state_enabled", guild_id) if music_player.autoplay_enabled else get_messages("autoplay_state_disabled", guild_id)
+        status_emoji = "✅" if music_player.autoplay_enabled else "❌"
 
         embed = Embed(
+            title=f"{status_emoji} Autoplay {state}",
             description=get_messages("autoplay_toggle", guild_id).format(state=state),
             color=0xC7CEEA if is_kawaii else discord.Color.blue()
         )
@@ -6363,38 +6718,10 @@ def run_bot(status_queue, log_queue, command_queue):
                 
         return choices
 
-    @bot.tree.command(name="remove", description="Opens an interactive menu to remove songs from the queue.")
+    @bot.tree.command(name="remove", description="[Deprecated] Use /queue remove instead. Opens an interactive menu to remove songs from the queue.")
     async def remove(interaction: discord.Interaction):
-        """
-        Shows an interactive, paginated, multi-select view for removing songs.
-        """
-        
-        if not interaction.guild:
-            await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True, silent=SILENT_MESSAGES)
-            return
-
-        guild_id = interaction.guild_id
-        is_kawaii = get_mode(guild_id)
-        music_player = get_player(guild_id)
-
-        if music_player.queue.empty():
-            embed = Embed(description=get_messages("queue_empty", guild_id), color=0xFF9AA2 if is_kawaii else discord.Color.red())
-            await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
-            return
-        
-        await interaction.response.defer()
-        
-        all_tracks = list(music_player.queue._queue)
-        view = RemoveView(interaction, all_tracks)
-        await view.update_view()
-        
-        embed = Embed(
-            title=get_messages("remove_title", guild_id),
-            description=get_messages("remove_description", guild_id),
-            color=0xC7CEEA if is_kawaii else discord.Color.blue()
-        )
-        
-        await interaction.followup.send(embed=embed, view=view, silent=SILENT_MESSAGES)
+        # Call the grouped handler
+        await queue_remove(interaction)
 
     # --- START OF NEW CODE BLOCK ---
     @bot.tree.command(name="search", description="Searches for a song and lets you choose from the top results.")
@@ -6402,6 +6729,18 @@ def run_bot(status_queue, log_queue, command_queue):
     async def search(interaction: discord.Interaction, query: str):
         if not interaction.guild:
             await interaction.response.send_message("This command can only be used in a server.", ephemeral=True, silent=SILENT_MESSAGES)
+            return
+        
+        # Rate limiting check
+        guild_id = interaction.guild_id
+        is_kawaii = get_mode(guild_id)
+        is_on_cooldown, remaining = check_cooldown(interaction.user.id, "search")
+        if is_on_cooldown:
+            embed = Embed(
+                description=f"Please wait {remaining:.1f} seconds before using this command again.",
+                color=0xFF9AA2 if is_kawaii else discord.Color.orange()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
             return
 
         await interaction.response.defer()
@@ -6436,6 +6775,9 @@ def run_bot(status_queue, log_queue, command_queue):
                 await interaction.followup.send(embed=embed, silent=SILENT_MESSAGES, ephemeral=True)
                 return
 
+            # Disable any existing search view for this guild
+            await disable_stale_view(guild_id, "search")
+            
             view = SearchView(search_results, guild_id)
             embed = Embed(
                 title=get_messages("search_results_title", guild_id),
@@ -6443,7 +6785,12 @@ def run_bot(status_queue, log_queue, command_queue):
                 color=0xC7CEEA if is_kawaii else discord.Color.blue()
             )
             
-            await interaction.followup.send(embed=embed, view=view, silent=SILENT_MESSAGES)
+            message = await interaction.followup.send(embed=embed, view=view, silent=SILENT_MESSAGES, ephemeral=True)
+            
+            # Track this view
+            if guild_id not in active_views:
+                active_views[guild_id] = {}
+            active_views[guild_id]["search"] = (view, message.id)
 
         except Exception as e:
             logger.error(f"Error during /search for '{query}': {e}", exc_info=True)
@@ -6467,6 +6814,9 @@ def run_bot(status_queue, log_queue, command_queue):
             return
         
         # Create the view and the initial embed
+        # Disable any existing seek view for this guild
+        await disable_stale_view(guild_id, "seek")
+        
         view = SeekView(interaction)
         
         # Create the initial embed (will be updated by the view)
@@ -6482,6 +6832,11 @@ def run_bot(status_queue, log_queue, command_queue):
         view.message = await interaction.original_response()
         await view.update_embed() # First manual update
         await view.start_update_task()
+        
+        # Track this view
+        if guild_id not in active_views:
+            active_views[guild_id] = {}
+        active_views[guild_id]["seek"] = (view, view.message.id)
         
 
     @bot.tree.command(name="volume", description="Adjusts the music volume for everyone (0-200%).")
@@ -6678,6 +7033,9 @@ def run_bot(status_queue, log_queue, command_queue):
         
         await interaction.response.defer()
         
+        # Disable any existing jumpto view for this guild
+        await disable_stale_view(guild_id, "jumpto")
+        
         all_tracks = list(music_player.queue._queue)
         view = JumpToView(interaction, all_tracks)
         await view.update_view()
@@ -6688,13 +7046,150 @@ def run_bot(status_queue, log_queue, command_queue):
             color=0xC7CEEA if is_kawaii else discord.Color.blue()
         )
         
-        await interaction.followup.send(embed=embed, view=view, silent=SILENT_MESSAGES)
+        message = await interaction.followup.send(embed=embed, view=view, silent=SILENT_MESSAGES)
+        
+        # Track this view
+        if guild_id not in active_views:
+            active_views[guild_id] = {}
+        active_views[guild_id]["jumpto"] = (view, message.id)
             
     # ==============================================================================
     # 6. DISCORD EVENTS
     # ==============================================================================
 
     bot.tree.add_command(SetupCommands(bot))
+    
+    # Queue command group
+    queue_group = app_commands.Group(name="queue", description="Queue management commands")
+    
+    @queue_group.command(name="show", description="Show the current song queue and status with pages.")
+    async def queue_show(interaction: discord.Interaction):
+        if not interaction.guild:
+            await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True, silent=SILENT_MESSAGES)
+            return
+
+        await interaction.response.defer()
+        guild_id = interaction.guild.id
+        music_player = get_player(guild_id)
+
+        is_24_7_normal = _24_7_active.get(guild_id, False) and not music_player.autoplay_enabled
+        tracks_for_display = []
+        
+        if is_24_7_normal and music_player.radio_playlist:
+            current_url = music_player.current_info.get('url') if music_player.current_info else None
+            try:
+                current_index = [t.get('url') for t in music_player.radio_playlist].index(current_url)
+                tracks_for_display = music_player.radio_playlist[current_index + 1:] + music_player.radio_playlist[:current_index + 1]
+            except (ValueError, IndexError):
+                tracks_for_display = music_player.radio_playlist
+        else:
+            tracks_for_display = list(music_player.queue._queue)
+
+        if not tracks_for_display and not music_player.current_info:
+            is_kawaii = get_mode(guild_id)
+            embed = Embed(
+                description=get_messages("queue_empty", guild_id),
+                color=0xFF9AA2 if is_kawaii else discord.Color.red()
+            )
+            await interaction.followup.send(silent=SILENT_MESSAGES, embed=embed, ephemeral=True)
+            return
+
+        # Disable any existing queue view for this guild
+        await disable_stale_view(guild_id, "queue")
+        
+        view = QueueView(interaction=interaction, tracks=tracks_for_display, items_per_page=5)
+        view.update_button_states()
+        initial_embed = await view.create_queue_embed()
+        message = await interaction.followup.send(embed=initial_embed, view=view, silent=SILENT_MESSAGES)
+        view.message = message
+        
+        # Track this view
+        if guild_id not in active_views:
+            active_views[guild_id] = {}
+        active_views[guild_id]["queue"] = (view, message.id)
+    
+    @queue_group.command(name="clear", description="Clear the current queue")
+    async def queue_clear(interaction: discord.Interaction):
+        if not interaction.guild:
+            await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True, silent=SILENT_MESSAGES)
+            return
+
+        guild_id = interaction.guild_id
+        is_kawaii = get_mode(guild_id)
+        music_player = get_player(guild_id)
+
+        bot.loop.create_task(update_controller(bot, interaction.guild.id))
+
+        while not music_player.queue.empty():
+            music_player.queue.get_nowait()
+
+        music_player.history.clear()
+        music_player.radio_playlist.clear()
+
+        embed = Embed(description=get_messages("clear_queue_success", guild_id), color=0xB5EAD7 if is_kawaii else discord.Color.green())
+        await interaction.response.send_message(silent=SILENT_MESSAGES,embed=embed)
+    
+    @queue_group.command(name="remove", description="Opens an interactive menu to remove songs from the queue.")
+    async def queue_remove(interaction: discord.Interaction):
+        """
+        Shows an interactive, paginated, multi-select view for removing songs.
+        """
+        if not interaction.guild:
+            await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True, silent=SILENT_MESSAGES)
+            return
+
+        guild_id = interaction.guild_id
+        is_kawaii = get_mode(guild_id)
+        music_player = get_player(guild_id)
+
+        if music_player.queue.empty():
+            embed = Embed(description=get_messages("queue_empty", guild_id), color=0xFF9AA2 if is_kawaii else discord.Color.red())
+            await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+            return
+
+        await interaction.response.defer()
+        
+        all_tracks = list(music_player.queue._queue)
+        view = RemoveView(interaction, all_tracks)
+        await view.update_view()
+        
+        embed = Embed(
+            title=get_messages("remove_title", guild_id),
+            description=get_messages("remove_description", guild_id),
+            color=0xC7CEEA if is_kawaii else discord.Color.blue()
+        )
+        
+        await interaction.followup.send(embed=embed, view=view, silent=SILENT_MESSAGES, ephemeral=True)
+    
+    @queue_group.command(name="shuffle", description="Shuffle the current queue")
+    async def queue_shuffle(interaction: discord.Interaction):
+        if not interaction.guild:
+            await interaction.response.send_message("This command can only be used inside a server.", ephemeral=True, silent=SILENT_MESSAGES)
+            return
+
+        guild_id = interaction.guild_id
+        is_kawaii = get_mode(guild_id)
+        music_player = get_player(guild_id)
+
+        if music_player.queue.empty():
+            embed = Embed(description=get_messages("queue_empty", guild_id), color=0xFF9AA2 if is_kawaii else discord.Color.red())
+            await interaction.response.send_message(embed=embed, ephemeral=True, silent=SILENT_MESSAGES)
+            return
+
+        queue_list = list(music_player.queue._queue)
+        random.shuffle(queue_list)
+        
+        new_queue = asyncio.Queue()
+        for item in queue_list:
+            await new_queue.put(item)
+        
+        music_player.queue = new_queue
+
+        embed = Embed(description=get_messages("shuffle_success", guild_id), color=0xB5EAD7 if is_kawaii else discord.Color.green())
+        await interaction.response.send_message(embed=embed, silent=SILENT_MESSAGES)
+        bot.loop.create_task(update_controller(bot, guild_id))
+    
+    bot.tree.add_command(queue_group)
 
     @bot.event
     async def on_message(message: discord.Message):
@@ -6864,6 +7359,113 @@ def run_bot(status_queue, log_queue, command_queue):
         await interaction.response.send_message(embed=embed, ephemeral=True, silent=True)
         return False
                         
+    # Auto-update system
+    async def wait_for_playback_to_finish():
+        """Wait until all active playback finishes or all users leave voice channels."""
+        max_wait_time = 3600  # Maximum 1 hour wait
+        check_interval = 10  # Check every 10 seconds
+        elapsed = 0
+        
+        while elapsed < max_wait_time:
+            # Check if any guild has active playback
+            has_active_playback = False
+            has_users_listening = False
+            
+            for guild_id, player in music_players.items():
+                vc = player.voice_client
+                if vc and vc.is_connected():
+                    # Check if there are users in the channel
+                    if len([m for m in vc.channel.members if not m.bot]) > 0:
+                        has_users_listening = True
+                    # Check if playing or has queue
+                    if (vc.is_playing() or vc.is_paused()) or not player.queue.empty():
+                        has_active_playback = True
+                        break
+            
+            # If no active playback and no users, safe to update
+            if not has_active_playback and not has_users_listening:
+                logger.info("All playback finished and no users listening. Safe to update.")
+                return True
+            
+            await asyncio.sleep(check_interval)
+            elapsed += check_interval
+        
+        logger.warning("Timeout waiting for playback to finish. Proceeding with update anyway.")
+        return False
+    
+    # Update check cooldown tracking
+    last_update_check_time = 0
+    
+    async def check_for_updates():
+        """Check GitHub for new releases."""
+        nonlocal last_update_check_time
+        try:
+            # Check if auto-update is disabled
+            auto_update = os.getenv("AUTO_UPDATE", "true").lower()
+            if auto_update != "true":
+                logger.info("Auto-update is disabled via AUTO_UPDATE environment variable.")
+                return None
+            
+            # Check for rate limiting (global cooldown)
+            current_time = time.time()
+            if current_time - last_update_check_time < 300:  # 5 min cooldown
+                return None
+            last_update_check_time = current_time
+            
+            response = requests.get(UPDATE_REPO_URL, timeout=10)
+            
+            # Handle rate limiting
+            if response.status_code == 403:
+                logger.warning("GitHub API rate limited. Skipping update check.")
+                return None
+            
+            response.raise_for_status()
+            latest_release = response.json()
+            latest_version_str = latest_release.get("tag_name", "v0.0.0").lstrip('v')
+            
+            if parse_version(latest_version_str) > parse_version(CURRENT_VERSION):
+                logger.info(f"New version found: {latest_version_str} (current: {CURRENT_VERSION})")
+                return latest_release
+            else:
+                logger.debug(f"Already on latest version: {CURRENT_VERSION}")
+                return None
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Failed to check for updates (network error): {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error checking for updates: {e}", exc_info=True)
+            return None
+    
+    async def check_for_updates_periodically():
+        """Periodic update checker that runs in the background."""
+        await bot.wait_until_ready()
+        
+        # Initial delay before first check
+        await asyncio.sleep(300)  # 5 minutes
+        
+        while not bot.is_closed():
+            try:
+                latest_release = await check_for_updates()
+                if latest_release:
+                    logger.info("Update available. Waiting for playback to finish...")
+                    await wait_for_playback_to_finish()
+                    
+                    # Notify via status queue (GUI app can handle the actual update)
+                    status_queue.put("UPDATE_AVAILABLE")
+                    log_queue.put(f"Update available: {latest_release.get('tag_name')}\n")
+                    logger.info("Update notification sent to GUI app.")
+                    
+                    # The GUI app will handle download and installation
+                    # Bot will be restarted by the GUI app after update
+                
+                # Wait before next check
+                await asyncio.sleep(UPDATE_CHECK_INTERVAL)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in update checker: {e}", exc_info=True)
+                await asyncio.sleep(UPDATE_CHECK_INTERVAL)
+
     @bot.event
     async def on_ready():
         logger.info(f"{bot.user.name} is online.")
@@ -6927,6 +7529,7 @@ def run_bot(status_queue, log_queue, command_queue):
 
             bot.loop.create_task(rotate_presence())
             bot.loop.create_task(command_checker())
+            bot.loop.create_task(check_for_updates_periodically())
             await load_states_on_startup()
 
         except Exception as e:

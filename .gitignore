@@ -101,3 +101,4 @@ playwright_browsers/
 
 # User-specific config (if any)
 config.local.*
+app/bin/ffmpeg.exe
