@@ -81,7 +81,7 @@ DB_PATH = os.path.join(APP_DATA_DIR, 'playify_state.db')
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
 # Auto-update configuration
-CURRENT_VERSION = "1.3.0"  # Must match app.py version
+CURRENT_VERSION = "1.4.0"  # Must match app.py version
 UPDATE_REPO_URL = "https://api.github.com/repos/Cthede11/playify/releases/latest"
 UPDATE_CHECK_INTERVAL = 3600  # Check every hour (3600 seconds)
 
