@@ -61,14 +61,14 @@ Before building, make sure version numbers match:
 
 1. **app/app.py:**
    ```python
-   CURRENT_VERSION = "1.3.0"  # Update this
+   CURRENT_VERSION = "1.4.1"  # Update this
    ```
 
 2. **app/playify_installer.iss:**
    ```ini
-   AppVersion=1.3.0  # Update this
-   AppVerName=Playify v1.3.0  # Update this
-   OutputBaseFilename=Playify_Setup_v1.3.0  # Update this
+   AppVersion=1.4.1  # Update this
+   AppVerName=Playify v1.4.1  # Update this
+   OutputBaseFilename=Playify_Setup_v1.4.1  # Update this
    ```
 
 ## Step 4: Build the Application (PyInstaller)
@@ -98,7 +98,7 @@ This will create:
 
 4. **Output:**
    - The installer will be created in `app/Output/`
-   - Filename: `Playify_Setup_v1.3.0.exe` (or your version)
+   - Filename: `Playify_Setup_v1.4.1.exe` (or your version)
 
 ## Step 6: Test the Build
 
@@ -109,7 +109,7 @@ This will create:
    ```
 
 2. **Test the installer:**
-   - Run `Playify_Setup_v1.3.0.exe`
+   - Run `Playify_Setup_v1.4.1.exe`
    - Install to a test location
    - Verify the app runs correctly
 
@@ -117,15 +117,15 @@ This will create:
 
 1. **Tag the release:**
    ```powershell
-   git tag v1.3.0
-   git push origin v1.3.0
+   git tag v1.4.1
+   git push origin v1.4.1
    ```
 
 2. **Create release on GitHub:**
    - Go to: https://github.com/Cthede11/playify/releases/new
-   - Tag: `v1.3.0`
-   - Title: `Playify v1.3.0`
-   - Upload: `Playify_Setup_v1.3.0.exe`
+   - Tag: `v1.4.1`
+   - Title: `Playify v1.4.1`
+   - Upload: `Playify_Setup_v1.4.1.exe`
    - Add release notes
 
 ## Quick Build Script

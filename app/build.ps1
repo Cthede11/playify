@@ -2,7 +2,7 @@
 # Run this from the app/ directory
 
 param(
-    [string]$Version = "1.3.0"
+    [string]$Version = "1.4.1"
 )
 
 Write-Host "========================================" -ForegroundColor Cyan

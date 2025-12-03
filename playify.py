@@ -3535,6 +3535,51 @@ def parse_yt_dlp_error(error_string: str) -> tuple[str, str, str]:
     # Default fallback for other access errors
     return ("🚫", "error.generic_access.title", "error.generic_access.description")
 
+def is_recoverable_error(error: Exception) -> bool:
+    """
+    Checks if an error is recoverable (e.g., 404, video unavailable, no results)
+    and should result in skipping to the next song rather than stopping playback.
+    """
+    error_str = str(error).lower()
+    error_type = type(error).__name__.lower()
+    
+    # Check for common recoverable error patterns
+    recoverable_patterns = [
+        "404",
+        "not found",
+        "no results found",
+        "video is unavailable",
+        "private video",
+        "video unavailable",
+        "unavailable",
+        "removed",
+        "deleted",
+        "does not exist",
+        "could not find",
+        "no entries",
+        "http error",
+        "http 404",
+        "http 403",
+        "http 410",
+        "access denied",
+        "age-restricted",
+        "sign in to confirm",
+    ]
+    
+    # Check if error message contains any recoverable pattern
+    if any(pattern in error_str for pattern in recoverable_patterns):
+        return True
+    
+    # Check for specific exception types that are typically recoverable
+    if "downloaderror" in error_type or "httperror" in error_type:
+        return True
+    
+    # ValueError with "No results" is recoverable
+    if isinstance(error, ValueError) and "no results" in error_str:
+        return True
+    
+    return False
+
 # ==============================================================================
 # 4. CORE AUDIO & PLAYBACK LOGIC
 # ==============================================================================
@@ -3543,9 +3588,44 @@ async def handle_playback_error(guild_id: int, error: Exception):
     """
     Handles unexpected errors during playback, informs the user,
     and provides instructions for reporting the bug.
+    For recoverable errors (404, no results, etc.), skips to the next song.
     """
     state = get_guild_state(guild_id)
     music_player = state.music_player
+    is_kawaii = (state.locale == Locale.EN_X_KAWAII)
+    
+    # Check if this is a recoverable error that should just skip to the next song
+    if is_recoverable_error(error):
+        logger.warning(f"[{guild_id}] Recoverable error during playback: {error}. Skipping to next song.")
+        
+        if music_player.text_channel:
+            try:
+                emoji, title_key, desc_key = parse_yt_dlp_error(str(error))
+                current_title = music_player.current_info.get('title', 'Unknown') if music_player.current_info else 'Unknown'
+                url_for_fetching = music_player.current_info.get('webpage_url') or music_player.current_info.get('url', '') if music_player.current_info else ''
+                
+                embed = Embed(
+                    title=f'{emoji} {get_messages("error.playback_failed.title", guild_id)}',
+                    description=get_messages(desc_key, guild_id) + "\n*" + get_messages("player.track_will_be_skipped", guild_id) + "*",
+                    color=0xFF9AA2 if is_kawaii else discord.Color.red()
+                )
+                if url_for_fetching:
+                    embed.add_field(name=get_messages("error.generic.affected_url_field", guild_id), value=f"`{url_for_fetching}`")
+                await music_player.text_channel.send(embed=embed, silent=SILENT_MESSAGES)
+            except discord.Forbidden:
+                pass
+            except Exception as e:
+                logger.error(f"Failed to send recoverable error message to guild {guild_id}: {e}")
+        
+        # Clear current info and skip to next song
+        music_player.current_info = None
+        music_player.current_url = None
+        
+        # Skip to the next song in the queue
+        bot.loop.create_task(play_audio(guild_id, song_that_just_ended=music_player.current_info))
+        return
+    
+    # For non-recoverable errors, use the original critical error handling
     if not music_player.text_channel:
         logger.error(f"Cannot report error in guild {guild_id}, no text channel available.")
         return
@@ -3553,8 +3633,6 @@ async def handle_playback_error(guild_id: int, error: Exception):
     tb_str = ''.join(traceback.format_exception(type(error), value=error, tb=error.__traceback__))
     logger.error(f"Unhandled playback error in guild {guild_id}:\n{tb_str}")
 
-    state = get_guild_state(guild_id)
-    is_kawaii = (state.locale == Locale.EN_X_KAWAII)
     embed = Embed(
         title=get_messages("critical_error_title", guild_id),
         description=get_messages("critical_error_description", guild_id),

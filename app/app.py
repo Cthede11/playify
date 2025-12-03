@@ -28,7 +28,7 @@ APP_NAME = "Playify"
 # Use semantic versioning (e.g., 1.1.1, 1.2.0, 2.0.0).
 # The GitHub release tag MUST match this number, prefixed with 'v' (e.g., v1.2.1).
 # ==============================================================================
-CURRENT_VERSION = "1.4.0"
+CURRENT_VERSION = "1.4.1"
 UPDATE_REPO_URL = "https://api.github.com/repos/Cthede11/playify/releases/latest"
 
 # Centralized path for all application data (config, browsers, etc.)
